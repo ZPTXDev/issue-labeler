@@ -35,28 +35,28 @@ async function run() {
         repo: context.repo.repo,
         issue_number,
     });
-
-    const issue_body = issue.data.body ?? getIssueOrPRBody();
+    const issueData = issue.data;
+    const issue_body = issueData.body ?? getIssueOrPRBody();
     if (issue_body === undefined) {
         console.log("Could not get issue or PR body from API or context, exiting");
         return;
     }
 
-    const issue_title = issue.data.title ?? getIssueOrPRTitle();
+    const issue_title = issueData.title ?? getIssueOrPRTitle();
     if (!issue_title) {
         console.log("Could not get issue or PR title from API or context, exiting");
         return;
     }
 
-    const labels: String[] = [];
-    issue.data.labels.forEach((label) => {
+    const currentLabels: String[] = [];
+    issueData.labels.forEach((label) => {
         if (typeof label === "string") {
         } else {
-            labels.push(<String>label.name);
+            currentLabels.push(<String>label.name);
         }
     });
 
-    debug(`Issue has the following labels #${labels}`);
+    debug(`Issue has the following labels #${currentLabels}`);
 
     if (enableVersionedRegex === 1) {
         const regexVersion = versionedRegex.exec(issue_body);
@@ -74,7 +74,7 @@ async function run() {
 
     // If the notBefore parameter has been set to a valid timestamp, exit if the current issue was created before notBefore
     if (notBefore) {
-        const issueCreatedAt = Date.parse(issue.data.created_at);
+        const issueCreatedAt = Date.parse(issueData.created_at);
         if (issueCreatedAt < notBefore) {
             console.log("Issue is before `notBefore` configuration parameter. Exiting...");
             return;
@@ -82,23 +82,30 @@ async function run() {
     }
 
     // Load our regex rules from the configuration path
-    const labelRegexes = await loadConfig(client, configPath);
+    const labelRulesMap = await loadConfig(client, configPath);
 
     let issueContent = "";
     if (includeTitle === 1) issueContent += `${issue_title}\n\n`;
     if (includeBody === 1) issueContent += issue_body;
 
-    for (const [label, globs] of labelRegexes.entries()) {
-        if (checkRegexes(issueContent, globs)) {
-            if (labels.includes("status:confirmed") && label === "status:proposed") continue;
-            if (labels.some((l) => l.startsWith("pr:type:")) && label.startsWith("pr:type:")) continue;
-            if (labels.some((l) => l.startsWith("type:")) && label.startsWith("type:")) continue;
-            toAdd.push(label);
-        } else if (syncLabels === 1 || label.startsWith("priority:")) {
-            if (labels.includes(label)) {
-                debug(`Marking #${label} label for removal`);
-                toRemove.push(label);
+    for (const [label, rules] of labelRulesMap.entries()) {
+        if (checkRegexes(issueContent, rules.regexes)) {
+            // Conflicting label is already present, do not add label
+            if (rules.conflicts?.some((conflictLabel) => currentLabels.includes(conflictLabel))) {
+                console.log(`Conflicting label is present. ${label} will not be added. `);
+                continue;
             }
+            // Only one label from this category can be applied, do not add label
+            if (rules.ignore_startswith?.some((labelName) => currentLabels.some((currentLabel) => currentLabel.startsWith(labelName)))) {
+                console.log(`Only one label from this category can be applied. ${label} will not be added. `);
+                continue;
+            }
+            toAdd.push(label);
+            continue;
+        }
+        if ((syncLabels === 1 || rules.always_sync === 1) && currentLabels.includes(label)) {
+            debug(`Marking #${label} label for removal`);
+            toRemove.push(label);
         }
     }
 
@@ -170,28 +177,36 @@ async function loadConfig(client: GitHubClient, configPath: string) {
 
         // loads (hopefully) a `{[label:string]: string | string[]}`, but is `any`:
         const configObject = loadYaml(configContent);
-
         // transform `any` => `Map<string,string[]>` or throw if yaml is malformed:
-        return getLabelRegexesMapFromObject(configObject);
+        return getLabelRulesMapFromObject(configObject);
     } catch (error) {
         console.log("Error loading configuration file: " + error);
         throw error;
     }
 }
 
-function getLabelRegexesMapFromObject(configObject: any) {
-    const labelRegexes = new Map<string, string[]>();
-    for (const label in configObject) {
-        if (typeof configObject[label] === "string") {
-            labelRegexes.set(label, [configObject[label]]);
-        } else if (Array.isArray(configObject[label])) {
-            labelRegexes.set(label, configObject[label]);
-        } else {
-            throw Error(`found unexpected type for label ${label} (should be string or array of regex)`);
+function getLabelRulesMapFromObject(configObject: any) {
+    const labelRulesMap = new Map<string, { regexes: string[]; conflicts?: string[]; ignore_startswith?: string[]; always_sync?: number }>();
+    const labels = configObject.labels;
+    for (const labelObj of labels) {
+        const labelName = labelObj.name;
+        debug(`LabelObject:\n${JSON.stringify(labelObj, null, 2)}`);
+        if (typeof labelObj === "string") {
+            labelRulesMap.set(labelName, { regexes: [labelObj] });
+            continue;
         }
+        const labelRegexes = labelObj.regex;
+        if (!Array.isArray(labelRegexes)) {
+            throw new Error(`Invalid regex format for label ${labelName}. Must be an array.`);
+        }
+        labelRulesMap.set(labelName, {
+            regexes: labelRegexes,
+            conflicts: labelObj.conflicts || [],
+            ignore_startswith: labelObj.ignore_startswith || [],
+            always_sync: labelObj.always_sync || 0,
+        });
     }
-
-    return labelRegexes;
+    return labelRulesMap;
 }
 
 function checkRegexes(issue_body: string, regexes: string[]) {
